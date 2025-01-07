@@ -10,6 +10,7 @@ import type {
 
 import type {
   EdrContext,
+  ExecutionResult,
   Provider as EdrProviderT,
   VmTraceDecoder as VmTraceDecoderT,
   VMTracer as VMTracerT,
