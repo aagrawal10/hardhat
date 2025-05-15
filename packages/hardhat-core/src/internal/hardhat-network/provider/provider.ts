@@ -8,6 +8,7 @@ import type {
 
 import type {
   EdrContext,
+  ExecutionResult,
   Provider as EdrProviderT,
   Response,
   SubscriptionEvent,
@@ -53,10 +54,13 @@ import {
 } from "./utils/convertToEdr";
 import { LoggerConfig, printLine, replaceLastLine } from "./modules/logger";
 import { MinimalEthereumJsVm, getMinimalEthereumJsVm } from "./vm/minimal-vm";
+const { bytesToHex } = require("@ethereumjs/util");
 
 const log = debug("hardhat:core:hardhat-network:provider");
 
 /* eslint-disable @nomicfoundation/hardhat-internal-rules/only-hardhat-error */
+
+const BUILDER_STATIC_ADDRESS = "0x000000000000000000636f6E736f6C652e6C6C67";
 
 export const DEFAULT_COINBASE = "0xc014ba5ec014ba5ec014ba5ec014ba5ec014ba5e";
 let _globalEdrContext: EdrContext | undefined;
@@ -73,6 +77,46 @@ export function getGlobalEdrContext(): EdrContext {
   }
 
   return _globalEdrContext;
+}
+
+function replacer(key: string, value: any): any {
+  if (
+    key === "code" ||
+    key === "codeAddress" ||
+    key === "pc" ||
+    key === "stackTop"
+  ) {
+    return undefined; // Skip these properties
+  }
+
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+
+  if (Buffer.isBuffer(value)) {
+    return value.toString("hex");
+  }
+
+  if (value.type === "Buffer" && Array.isArray(value.data)) {
+    return Buffer.from(value.data).toString("hex");
+  }
+
+  return value;
+}
+
+function getExecutionResult(r: ExecutionResult): any {
+  if (!("output" in r.result)) {
+    // Halt result
+    return { status: "halt" };
+  }
+
+  if (Buffer.isBuffer(r.result.output)) {
+    // Revert result
+    return { status: "revert", output: r.result.output };
+  }
+
+  // Success result
+  return { status: "success", output: r.result.output.returnValue };
 }
 
 interface HardhatNetworkProviderConfig {
@@ -277,8 +321,20 @@ export class EdrProviderWrapper
       return 0;
     }
 
+    // Exposing a new JSON RPC method eth_callWithLogs that calls eth_call to the underlying layer.
+    // It gets the response, trace and returns both of them to the caller.
+    let requestMethod = args.method;
+    let forceTraces = false;
+    if (requestMethod === "eth_callWithLogs") {
+      requestMethod = "eth_call";
+      forceTraces = true;
+    } else if (requestMethod === "eth_sendRawTransactionWithTraces") {
+      requestMethod = "eth_sendRawTransaction";
+      forceTraces = true;
+    }
+
     const stringifiedArgs = JSON.stringify({
-      method: args.method,
+      method: requestMethod,
       params,
     });
 
@@ -297,7 +353,9 @@ export class EdrProviderWrapper
       this._node._vm.evm.events.eventNames().length > 0 ||
       this._node._vm.events.eventNames().length > 0;
 
-    if (needsTraces) {
+    const relevantLogs: string[] = [];
+    const relevantTraces: string[] = [];
+    if (needsTraces || forceTraces) {
       const rawTraces = responseObject.traces;
       for (const rawTrace of rawTraces) {
         // For other consumers in JS we need to marshall the entire trace over FFI
@@ -308,9 +366,34 @@ export class EdrProviderWrapper
           this._node._vm.events.emit("beforeTx");
         }
 
-        for (const traceItem of trace) {
+        for (let index = 0; index < trace.length; index++) {
+          const traceItem = trace[index];
+
           // step event
           if ("pc" in traceItem) {
+            if (index !== trace.length - 1) {
+              const nextTraceItem = trace[index + 1];
+              if (
+                !("pc" in nextTraceItem) &&
+                !("executionResult" in nextTraceItem)
+              ) {
+                // console.log(JSON.stringify(traceItem, replacer, 2));
+                relevantTraces.push(JSON.stringify(traceItem, replacer, 2));
+              }
+            }
+
+            if (
+              traceItem.opcode === "LOG" ||
+              traceItem.opcode === "LOG1" ||
+              traceItem.opcode === "LOG2" ||
+              traceItem.opcode === "LOG3" ||
+              traceItem.opcode === "LOG4"
+            ) {
+              // Capture all LOG opcodes
+              // console.log(JSON.stringify(traceItem, replacer, 2));
+              relevantTraces.push(JSON.stringify(traceItem, replacer, 2));
+            }
+
             if (this._node._vm.evm.events.listenerCount("step") > 0) {
               this._node._vm.evm.events.emit(
                 "step",
@@ -320,6 +403,14 @@ export class EdrProviderWrapper
           }
           // afterMessage event
           else if ("executionResult" in traceItem) {
+            relevantTraces.push(
+              JSON.stringify(
+                getExecutionResult(traceItem.executionResult),
+                replacer,
+                2
+              )
+            );
+
             if (this._node._vm.evm.events.listenerCount("afterMessage") > 0) {
               this._node._vm.evm.events.emit(
                 "afterMessage",
@@ -329,6 +420,16 @@ export class EdrProviderWrapper
           }
           // beforeMessage event
           else {
+            // In case this is a trace to known static address, add to relevant logs
+            // console.log(JSON.stringify(traceItem, replacer, 2));
+            relevantTraces.push(JSON.stringify(traceItem, replacer, 2));
+            if (
+              traceItem.to !== undefined &&
+              bytesToHex(traceItem.to) === BUILDER_STATIC_ADDRESS.toLowerCase()
+            ) {
+              relevantLogs.push(bytesToHex(traceItem.data));
+            }
+
             if (this._node._vm.evm.events.listenerCount("beforeMessage") > 0) {
               this._node._vm.evm.events.emit(
                 "beforeMessage",
@@ -391,7 +492,20 @@ export class EdrProviderWrapper
       args.method === "debug_traceTransaction" ||
       args.method === "debug_traceCall"
     ) {
+      // This is where trace is translated.
       return edrRpcDebugTraceToHardhat(response.result);
+    } else if (args.method === "eth_callWithLogs") {
+      const finalResult = {
+        result: response.result,
+        traces: relevantLogs,
+      };
+      return finalResult;
+    } else if (args.method === "eth_sendRawTransactionWithTraces") {
+      const finalResult = {
+        result: response.result,
+        traces: relevantTraces,
+      };
+      return finalResult;
     } else {
       return response.result;
     }

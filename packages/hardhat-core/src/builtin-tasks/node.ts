@@ -299,6 +299,12 @@ task(TASK_NODE, "Starts a JSON-RPC server on top of Hardhat Network")
         );
       }
 
+      console.log(
+        picocolors.bold(
+          "NOTE: RUNNING CUSTOM LATEST PECTRA PACKAGE WITH eth_callWithLogs"
+        )
+      );
+
       try {
         const provider: EthereumProvider = await run(TASK_NODE_GET_PROVIDER, {
           forkBlockNumber,
