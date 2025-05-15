@@ -106,3 +106,7 @@ pnpm-lock.json
 
 # Hardhat bundle
 bundle/
+
+
+crates/
+target/
